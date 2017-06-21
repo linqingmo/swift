@@ -250,11 +250,6 @@ public:
     return Ident.get() < RHS.Ident.get();
   }
 
-  // TODO: Remove once migration to DeclBaseName has been completed
-  operator Identifier() {
-    return getIdentifier();
-  }
-
   const void *getAsOpaquePointer() const { return Ident.get(); }
 
   static DeclBaseName getFromOpaquePointer(void *P) {
@@ -580,6 +575,12 @@ public:
     }
 
     return Storage.getArgumentNames();
+  }
+
+  /// Asserts that this is a nullary selector and returns the single identifier.
+  Identifier getSimpleName() const {
+    assert(Storage.isSimpleName() && "not a nullary selector");
+    return Storage.getBaseIdentifier();
   }
 
   /// Get a string representation of the selector.

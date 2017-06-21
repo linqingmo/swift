@@ -569,6 +569,7 @@ bool Parser::parseNewDeclAttribute(DeclAttributes &Attributes, SourceLoc AtLoc,
 
   case DAK_RawDocComment:
   case DAK_ObjCBridged:
+  case DAK_ObjCRuntimeName:
   case DAK_SynthesizedProtocol:
     llvm_unreachable("virtual attributes should not be parsed "
                      "by attribute parsing code");
@@ -743,8 +744,7 @@ bool Parser::parseNewDeclAttribute(DeclAttributes &Attributes, SourceLoc AtLoc,
   }
 
   case DAK_CDecl:
-  case DAK_SILGenName:
-  case DAK_NSKeyedArchiverClassName: {
+  case DAK_SILGenName: {
     if (!consumeIf(tok::l_paren)) {
       diagnose(Loc, diag::attr_expected_lparen, AttrName,
                DeclAttribute::isDeclModifier(DK));
@@ -786,10 +786,6 @@ bool Parser::parseNewDeclAttribute(DeclAttributes &Attributes, SourceLoc AtLoc,
                                                 AttrRange, /*Implicit=*/false));
       else if (DK == DAK_CDecl)
         Attributes.add(new (Context) CDeclAttr(AsmName.getValue(), AtLoc,
-                                               AttrRange, /*Implicit=*/false));
-      else if (DK == DAK_NSKeyedArchiverClassName)
-        Attributes.add(new (Context) NSKeyedArchiverClassNameAttr(
-                                               AsmName.getValue(), AtLoc,
                                                AttrRange, /*Implicit=*/false));
       else
         llvm_unreachable("out of sync with switch");
@@ -1485,6 +1481,38 @@ bool Parser::parseDeclAttribute(DeclAttributes &Attributes, SourceLoc AtLoc) {
     return false;
   }
 
+  // FIXME: Remove this after Swift 4.
+  if (DK == DAK_Count && Tok.getText() == "NSKeyedArchiverClassName") {
+    auto activeDiag = diagnose(Tok,diag::attr_nskeyedarchiverclassname_removed);
+    activeDiag.fixItReplace(Tok.getLoc(), "objc");
+    consumeToken();
+    SourceLoc lParenLoc;
+    if (consumeIf(tok::l_paren, lParenLoc)) {
+      if (Tok.is(tok::string_literal)) {
+        activeDiag.fixItRemoveChars(Tok.getLoc(),
+                                    Tok.getLoc().getAdvancedLoc(1));
+        SourceLoc endLoc = Tok.getLoc().getAdvancedLoc(Tok.getLength());
+        activeDiag.fixItRemoveChars(endLoc.getAdvancedLoc(-1), endLoc);
+      }
+      skipUntil(tok::r_paren);
+      SourceLoc rParenLoc;
+      parseMatchingToken(tok::r_paren, rParenLoc,
+                         diag::attr_warn_unused_result_expected_rparen,
+                         lParenLoc);
+    }
+    return false;
+  }
+
+  // FIXME: Remove this after Swift 4.
+  if (DK == DAK_Count &&
+      Tok.getText() == "NSKeyedArchiverEncodeNonGenericSubclassesOnly") {
+    diagnose(Tok,
+             diag::attr_nskeyedarchiverencodenongenericsubclassesonly_removed)
+      .fixItRemove(SourceRange(AtLoc, Tok.getLoc()));
+    consumeToken();
+    return false;
+  }
+
   if (DK != DAK_Count && !DeclAttribute::shouldBeRejectedByParser(DK))
     return parseNewDeclAttribute(Attributes, AtLoc, DK);
 
@@ -2100,13 +2128,40 @@ Parser::parseDecl(ParseDeclOptions Flags,
   }
 
   if (Tok.is(tok::pound_if)) {
-    auto IfConfigResult = parseDeclIfConfig(Flags);
+    auto IfConfigResult = parseIfConfig(
+      [&](SmallVectorImpl<ASTNode> &Decls, bool IsActive) {
+        Optional<Scope> scope;
+        if (!IsActive)
+          scope.emplace(this, getScopeInfo().getCurrentScope()->getKind(),
+                        /*inactiveConfigBlock=*/true);
+
+        ParserStatus Status;
+        bool PreviousHadSemi = true;
+        while (Tok.isNot(tok::pound_else, tok::pound_endif, tok::pound_elseif,
+                         tok::eof)) {
+          if (Tok.is(tok::r_brace)) {
+            diagnose(Tok.getLoc(),
+                      diag::unexpected_rbrace_in_conditional_compilation_block);
+            // If we see '}', following declarations don't look like belong to
+            // the current decl context; skip them.
+            skipUntilConditionalBlockClose();
+            break;
+          }
+          Status |= parseDeclItem(PreviousHadSemi, Flags,
+                                  [&](Decl *D) {Decls.emplace_back(D);});
+        }
+      });
+
     if (auto ICD = IfConfigResult.getPtrOrNull()) {
       // The IfConfigDecl is ahead of its members in source order.
       Handler(ICD);
       // Copy the active members into the entries list.
-      for (auto activeMember : ICD->getActiveMembers()) {
-        Handler(activeMember);
+      for (auto activeMember : ICD->getActiveClauseElements()) {
+        auto *D = activeMember.get<Decl*>();
+        if (isa<IfConfigDecl>(D))
+          // Don't hoist nested '#if'.
+          continue;
+        Handler(D);
       }
     }
     return IfConfigResult;
@@ -3390,29 +3445,28 @@ static FuncDecl *createAccessorFunc(SourceLoc DeclLoc, ParameterList *param,
   // Non-static set/willSet/didSet/materializeForSet/mutableAddress
   // default to mutating.  get/address default to
   // non-mutating.
-  if (!D->isStatic()) {
-    switch (Kind) {
-    case AccessorKind::IsAddressor:
-      D->setAddressorKind(addressorKind);
-      break;
+  switch (Kind) {
+  case AccessorKind::IsAddressor:
+    D->setAddressorKind(addressorKind);
+    break;
 
-    case AccessorKind::IsGetter:
-      break;
+  case AccessorKind::IsGetter:
+    break;
 
-    case AccessorKind::IsMutableAddressor:
-      D->setAddressorKind(addressorKind);
-      LLVM_FALLTHROUGH;
+  case AccessorKind::IsMutableAddressor:
+    D->setAddressorKind(addressorKind);
+    LLVM_FALLTHROUGH;
 
-    case AccessorKind::IsSetter:
-    case AccessorKind::IsWillSet:
-    case AccessorKind::IsDidSet:
+  case AccessorKind::IsSetter:
+  case AccessorKind::IsWillSet:
+  case AccessorKind::IsDidSet:
+    if (D->isInstanceMember())
       D->setMutating();
-      break;
+    break;
 
-    case AccessorKind::IsMaterializeForSet:
-    case AccessorKind::NotAccessor:
-      llvm_unreachable("not parseable accessors");
-    }
+  case AccessorKind::IsMaterializeForSet:
+  case AccessorKind::NotAccessor:
+    llvm_unreachable("not parseable accessors");
   }
 
   return D;

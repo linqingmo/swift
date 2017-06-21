@@ -108,15 +108,13 @@ void IterativeTypeChecker::processResolveInheritedClauseEntry(
 
   // Validate the type of this inherited clause entry.
   // FIXME: Recursion into existing type checker.
-  Optional<ProtocolRequirementTypeResolver> protoResolver;
-  Optional<GenericTypeToArchetypeResolver> archetypeResolver;
+  ProtocolRequirementTypeResolver protoResolver;
+  GenericTypeToArchetypeResolver archetypeResolver(dc);
   GenericTypeResolver *resolver;
-  if (auto *proto = dyn_cast<ProtocolDecl>(dc)) {
-    protoResolver.emplace(proto);
-    resolver = protoResolver.getPointer();
+  if (isa<ProtocolDecl>(dc)) {
+    resolver = &protoResolver;
   } else {
-    archetypeResolver.emplace(dc);
-    resolver = archetypeResolver.getPointer();
+    resolver = &archetypeResolver;
   }
 
   if (TC.validateType(*inherited, dc, options, resolver,
@@ -342,8 +340,6 @@ void IterativeTypeChecker::processResolveTypeDecl(
   if (auto typeAliasDecl = dyn_cast<TypeAliasDecl>(typeDecl)) {
     if (typeAliasDecl->getDeclContext()->isModuleScopeContext() &&
         typeAliasDecl->getGenericParams() == nullptr) {
-      typeAliasDecl->setValidationStarted();
-
       TypeResolutionOptions options = TR_TypeAliasUnderlyingType;
       if (typeAliasDecl->getFormalAccess() <= Accessibility::FilePrivate)
         options |= TR_KnownNonCascadingDependency;

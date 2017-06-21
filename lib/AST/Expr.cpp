@@ -261,16 +261,16 @@ void Expr::propagateLValueAccessKind(AccessKind accessKind,
     }
 
     void visitMemberRefExpr(MemberRefExpr *E, AccessKind accessKind) {
-      if (!GetType(E->getBase())->isLValueType()) return;
+      if (!GetType(E->getBase())->hasLValueType()) return;
       visit(E->getBase(), getBaseAccessKind(E->getMember(), accessKind));
     }
     void visitSubscriptExpr(SubscriptExpr *E, AccessKind accessKind) {
-      if (!GetType(E->getBase())->isLValueType()) return;
+      if (!GetType(E->getBase())->hasLValueType()) return;
       visit(E->getBase(), getBaseAccessKind(E->getDecl(), accessKind));
     }
     void visitKeyPathApplicationExpr(KeyPathApplicationExpr *E,
                                      AccessKind accessKind) {
-      if (!GetType(E->getBase())->isLValueType()) return;
+      if (!GetType(E->getBase())->hasLValueType()) return;
       auto kpDecl = GetType(E->getKeyPath())->castTo<BoundGenericType>()
         ->getDecl();
       AccessKind baseAccess;
@@ -502,6 +502,9 @@ ConcreteDeclRef Expr::getReferencedDecl() const {
   PASS_THROUGH_REFERENCE(PointerToPointer, getSubExpr);
   PASS_THROUGH_REFERENCE(ForeignObjectConversion, getSubExpr);
   PASS_THROUGH_REFERENCE(UnevaluatedInstance, getSubExpr);
+  PASS_THROUGH_REFERENCE(BridgeToObjC, getSubExpr);
+  PASS_THROUGH_REFERENCE(BridgeFromObjC, getSubExpr);
+  PASS_THROUGH_REFERENCE(ConditionalBridgeFromObjC, getSubExpr);
   NO_REFERENCE(Coerce);
   NO_REFERENCE(ForcedCheckedCast);
   NO_REFERENCE(ConditionalCheckedCast);
@@ -789,6 +792,9 @@ bool Expr::canAppendPostfixExpression(bool appendingPostfixOperator) const {
   case ExprKind::ForeignObjectConversion:
   case ExprKind::UnevaluatedInstance:
   case ExprKind::EnumIsCase:
+  case ExprKind::ConditionalBridgeFromObjC:
+  case ExprKind::BridgeFromObjC:
+  case ExprKind::BridgeToObjC:
     // Implicit conversion nodes have no syntax of their own; defer to the
     // subexpression.
     return cast<ImplicitConversionExpr>(this)->getSubExpr()

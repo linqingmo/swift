@@ -46,8 +46,10 @@
 #include <execinfo.h>
 #endif
 
-#ifdef __APPLE__
+#if defined(__APPLE__)
 #include <asl.h>
+#elif defined(__ANDROID__)
+#include <android/log.h>
 #endif
 
 namespace FatalErrorFlags {
@@ -228,8 +230,10 @@ reportNow(uint32_t flags, const char *message)
 #else
   write(STDERR_FILENO, message, strlen(message));
 #endif
-#ifdef __APPLE__
+#if defined(__APPLE__)
   asl_log(nullptr, nullptr, ASL_LEVEL_ERR, "%s", message);
+#elif defined(__ANDROID__)
+  __android_log_print(ANDROID_LOG_FATAL, "SwiftRuntime", "%s", message);
 #endif
 #if SWIFT_SUPPORTS_BACKTRACE_REPORTING
   if (flags & FatalErrorFlags::ReportBacktrace) {
@@ -237,6 +241,20 @@ reportNow(uint32_t flags, const char *message)
     printCurrentBacktrace();
   }
 #endif
+}
+
+LLVM_ATTRIBUTE_NOINLINE SWIFT_RUNTIME_EXPORT
+void _swift_runtime_on_report(bool isFatal, const char *message,
+                              RuntimeErrorDetails *details) {
+  // Do nothing. This function is meant to be used by the debugger.
+
+  // The following is necessary to avoid calls from being optimized out.
+  asm volatile("" ::: "memory");
+}
+
+void swift::reportToDebugger(bool isFatal, const char *message,
+                             RuntimeErrorDetails *details) {
+  _swift_runtime_on_report(isFatal, message, details);
 }
 
 /// Report a fatal error to system console, stderr, and crash logs.

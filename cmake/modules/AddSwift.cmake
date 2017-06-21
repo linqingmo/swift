@@ -359,9 +359,10 @@ function(_add_variant_link_flags)
     endif()
   elseif("${LFLAGS_SDK}" STREQUAL "ANDROID")
     list(APPEND result
-        "-ldl"
+        "-ldl" "-llog" "-latomic" "-licudata" "-licui18n" "-licuuc"
         "${SWIFT_ANDROID_NDK_PATH}/sources/cxx-stl/llvm-libc++/libs/armeabi-v7a/libc++_shared.so")
     list(APPEND library_search_directories
+        "${SWIFT_ANDROID_PREBUILT_PATH}/arm-linux-androideabi/lib/armv7-a"
         "${SWIFT_ANDROID_PREBUILT_PATH}/lib/gcc/arm-linux-androideabi/${SWIFT_ANDROID_NDK_GCC_VERSION}.x")
   else()
     # If lto is enabled, we need to add the object path flag so that the LTO code
@@ -1500,6 +1501,12 @@ function(add_swift_library name)
           if("${lib}" STREQUAL "ICU_UC")
             list(APPEND swiftlib_private_link_libraries_targets
                  "${SWIFT_${sdk}_ICU_UC}")
+            # temporary fix for atomic needing to be
+            # after object files for libswiftCore.so
+            if("${sdk}" STREQUAL "ANDROID")
+              list(APPEND swiftlib_private_link_libraries_targets
+                   "-latomic")
+            endif()
           elseif("${lib}" STREQUAL "ICU_I18N")
             list(APPEND swiftlib_private_link_libraries_targets
                  "${SWIFT_${sdk}_ICU_I18N}")
@@ -2117,3 +2124,8 @@ function(add_swift_host_tool executable)
     endif()
   endif()
 endfunction()
+
+macro(add_swift_tool_symlink name dest component)
+  add_llvm_tool_symlink(${name} ${dest} ALWAYS_GENERATE)
+  llvm_install_symlink(${name} ${dest} ALWAYS_GENERATE COMPONENT ${component})
+endmacro()

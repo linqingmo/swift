@@ -16,6 +16,7 @@
 //
 //===----------------------------------------------------------------------===//
 #include "TypeChecker.h"
+#include "swift/AST/Initializer.h"
 #include "swift/AST/NameLookup.h"
 #include "swift/AST/ProtocolConformance.h"
 #include "swift/Basic/TopCollection.h"
@@ -186,21 +187,19 @@ LookupResult TypeChecker::lookupUnqualified(DeclContext *dc, DeclName name,
   for (const auto &found : lookup.Results) {
     // Determine which type we looked through to find this result.
     Type foundInType;
+
     if (!found.getBaseDecl()) {
       // Not found within a type.
-    } else if (auto baseParam = dyn_cast<ParamDecl>(found.getBaseDecl())) {
-      auto baseDC = baseParam->getDeclContext();
-      if (isa<AbstractFunctionDecl>(baseDC))
-        baseDC = baseDC->getParent();
-      foundInType = baseDC->getDeclaredTypeInContext();
     } else {
-      auto baseNominal = cast<NominalTypeDecl>(found.getBaseDecl());
-      for (auto currentDC = dc; currentDC; currentDC = currentDC->getParent()) {
-        if (currentDC->getAsNominalTypeOrNominalTypeExtensionContext()
-              == baseNominal) {
-          foundInType = currentDC->getDeclaredTypeInContext();
-        }
+      DeclContext *baseDC = nullptr;
+      if (auto baseParam = dyn_cast<ParamDecl>(found.getBaseDecl())) {
+        baseDC = baseParam->getDeclContext()->getParent();
+      } else {
+        baseDC = cast<NominalTypeDecl>(found.getBaseDecl());
       }
+
+      foundInType = dc->mapTypeIntoContext(
+        baseDC->getDeclaredInterfaceType());
       assert(foundInType && "bogus base declaration?");
     }
 
@@ -410,6 +409,14 @@ LookupTypeResult TypeChecker::lookupMemberType(DeclContext *dc,
           continue;
         }
       }
+
+      // Nominal type members of protocols cannot be accessed with an
+      // archetype base, because we have no way to recover the correct
+      // substitutions.
+      if (type->is<ArchetypeType>() &&
+          isa<NominalTypeDecl>(typeDecl)) {
+        continue;
+      }
     }
 
     // Substitute the base into the member's type.
@@ -447,6 +454,13 @@ LookupTypeResult TypeChecker::lookupMemberType(DeclContext *dc,
       // Use the type witness.
       auto concrete = conformance->getConcrete();
       Type memberType = concrete->getTypeWitness(assocType, this);
+
+      // This is the only case where NormalProtocolConformance::
+      // getTypeWitnessAndDecl() returns a null type.
+      if (concrete->getState() ==
+          ProtocolConformanceState::CheckingTypeWitnesses)
+        continue;
+
       assert(memberType && "Missing type witness?");
 
       // If we haven't seen this type result yet, add it to the result set.

@@ -467,7 +467,7 @@ bool TypeBase::isBool() {
 
 
 bool TypeBase::isAssignableType() {
-  if (isLValueType()) return true;
+  if (hasLValueType()) return true;
   if (auto tuple = getAs<TupleType>()) {
     for (auto eltType : tuple->getElementTypes()) {
       if (!eltType->isAssignableType())
@@ -480,7 +480,7 @@ bool TypeBase::isAssignableType() {
 
 Type TypeBase::getRValueType() {
   // If the type is not an lvalue, this is a no-op.
-  if (!isLValueType())
+  if (!hasLValueType())
     return this;
 
   return Type(this).transform([](Type t) -> Type {
@@ -760,9 +760,8 @@ swift::decomposeArgType(Type type, ArrayRef<Identifier> argumentLabels) {
   return result;
 }
 
-SmallVector<CallArgParam, 4>
-swift::decomposeParamType(Type type, const ValueDecl *paramOwner,
-                          unsigned level) {
+void swift::computeDefaultMap(Type type, const ValueDecl *paramOwner,
+                              unsigned level, SmallVectorImpl<bool> &outDefaultMap) {
   // Find the corresponding parameter list.
   const ParameterList *paramList = nullptr;
   if (paramOwner) {
@@ -774,50 +773,33 @@ swift::decomposeParamType(Type type, const ValueDecl *paramOwner,
         paramList = subscript->getIndices();
     }
   }
-
-  SmallVector<CallArgParam, 4> result;
+  
   switch (type->getKind()) {
   case TypeKind::Tuple: {
     auto tupleTy = cast<TupleType>(type.getPointer());
-
+    
     // FIXME: In the weird case where we have a tuple type that should
     // be wrapped in a ParenType but isn't, just... forget it happened.
     if (paramList && tupleTy->getNumElements() != paramList->size() &&
         paramList->size() == 1)
       paramList = nullptr;
-
+    
     for (auto i : range(0, tupleTy->getNumElements())) {
-      const auto &elt = tupleTy->getElement(i);
-
-      CallArgParam argParam;
-      argParam.Ty = elt.isVararg() ? elt.getVarargBaseTy() : elt.getType();
-      argParam.Label = elt.getName();
-      argParam.HasDefaultArgument =
-          paramList && paramList->get(i)->isDefaultArgument();
-      argParam.parameterFlags = elt.getParameterFlags();
-      result.push_back(argParam);
+      outDefaultMap.push_back(paramList && paramList->get(i)->isDefaultArgument());
     }
     break;
   }
-
+      
   case TypeKind::Paren: {
-    CallArgParam argParam;
-    argParam.Ty = cast<ParenType>(type.getPointer())->getUnderlyingType();
-    argParam.HasDefaultArgument =
-        paramList && paramList->get(0)->isDefaultArgument();
-    result.push_back(argParam);
+    outDefaultMap.push_back(paramList && paramList->get(0)->isDefaultArgument());
     break;
   }
-
+      
   default: {
-    CallArgParam argParam;
-    argParam.Ty = type;
-    result.push_back(argParam);
+    outDefaultMap.push_back(false);
     break;
   }
   }
-
-  return result;
 }
 
 /// Turn a param list into a symbolic and printable representation that does not
@@ -3156,6 +3138,24 @@ Type Type::substDependentTypesWithErrorTypes() const {
                     SubstFlags::UseErrorType));
 }
 
+const DependentMemberType *TypeBase::findUnresolvedDependentMemberType() {
+  if (!hasTypeParameter()) return nullptr;
+
+  const DependentMemberType *unresolvedDepMemTy = nullptr;
+  Type(this).findIf([&](Type type) -> bool {
+    if (auto depMemTy = type->getAs<DependentMemberType>()) {
+      if (depMemTy->getAssocType() == nullptr) {
+        unresolvedDepMemTy = depMemTy;
+        return true;
+      }
+    }
+    return false;
+  });
+
+  return unresolvedDepMemTy;
+}
+
+
 Type TypeBase::getSuperclassForDecl(const ClassDecl *baseClass) {
   Type t(this);
   while (t) {
@@ -3185,7 +3185,7 @@ TypeBase::getContextSubstitutions(const DeclContext *dc,
   assert(dc->isTypeContext());
   Type baseTy(this);
 
-  assert(!baseTy->isLValueType() && !baseTy->is<AnyMetatypeType>());
+  assert(!baseTy->hasLValueType() && !baseTy->is<AnyMetatypeType>());
 
   // The resulting set of substitutions. Always use this to ensure we
   // don't miss out on NRVO anywhere.
@@ -3623,6 +3623,9 @@ case TypeKind::Id:
   case TypeKind::NameAlias: {
     auto alias = cast<NameAliasType>(base);
     auto underlyingTy = Type(alias->getSinglyDesugaredType());
+    if (!underlyingTy)
+      return Type();
+
     auto transformedTy = underlyingTy.transformRec(fn);
     if (!transformedTy)
       return Type();
@@ -3906,24 +3909,25 @@ case TypeKind::Id:
 
   case TypeKind::ProtocolComposition: {
     auto pc = cast<ProtocolCompositionType>(base);
-    SmallVector<Type, 4> members;
+    SmallVector<Type, 4> substMembers;
+    auto members = pc->getMembers();
     bool anyChanged = false;
     unsigned index = 0;
-    for (auto member : pc->getMembers()) {
+    for (auto member : members) {
       auto substMember = member.transformRec(fn);
       if (!substMember)
         return Type();
       
       if (anyChanged) {
-        members.push_back(substMember);
+        substMembers.push_back(substMember);
         ++index;
         continue;
       }
       
       if (substMember.getPointer() != member.getPointer()) {
         anyChanged = true;
-        members.append(members.begin(), members.begin() + index);
-        members.push_back(substMember);
+        substMembers.append(members.begin(), members.begin() + index);
+        substMembers.push_back(substMember);
       }
       
       ++index;
@@ -3932,7 +3936,8 @@ case TypeKind::Id:
     if (!anyChanged)
       return *this;
     
-    return ProtocolCompositionType::get(Ptr->getASTContext(), members,
+    return ProtocolCompositionType::get(Ptr->getASTContext(),
+                                        substMembers,
                                         pc->hasExplicitAnyObject());
   }
   }

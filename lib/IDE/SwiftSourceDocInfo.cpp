@@ -108,6 +108,14 @@ bool SemaLocResolver::tryResolve(Stmt *St) {
   return false;
 }
 
+bool SemaLocResolver::tryResolve(Expr *Exp) {
+  if (!Exp->isImplicit() && Exp->getStartLoc() == LocToResolve) {
+    SemaTok = { Exp };
+    return true;
+  }
+  return false;
+}
+
 bool SemaLocResolver::visitSubscriptReference(ValueDecl *D, CharSourceRange Range,
                                               bool IsOpenBracket) {
   // We should treat both open and close brackets equally
@@ -187,6 +195,12 @@ bool SemaLocResolver::walkToExprPre(Expr *E) {
     }
   }
   return true;
+}
+
+bool SemaLocResolver::walkToExprPost(Expr *E) {
+  if (isDone())
+    return false;
+  return !tryResolve(E);
 }
 
 bool SemaLocResolver::visitCallArgName(Identifier Name, CharSourceRange Range,
@@ -533,8 +547,7 @@ private:
                  unsigned StartIdx, unsigned EndIdx) :
     File(File), Ctx(File.getASTContext()), SM(Ctx.SourceMgr),
     AllTokens(AllTokens), StartTok(AllTokens[StartIdx]), EndTok(AllTokens[EndIdx]),
-    Start(StartTok.getLoc()), End(EndTok.getLoc()),
-    Content(getContentRange()) {
+    Start(StartTok.getLoc()), End(EndTok.getLoc()), Content(getContentRange()) {
       assert(Start.isValid() && End.isValid());
   }
 
@@ -579,8 +592,8 @@ public:
     ContextStack.pop_back();
   }
 
-  static Implementation *createInstance(SourceFile &File, unsigned StartOff,
-                                        unsigned Length) {
+  static std::unique_ptr<Implementation>
+  createInstance(SourceFile &File, unsigned StartOff, unsigned Length) {
     SourceManager &SM = File.getASTContext().SourceMgr;
     unsigned BufferId = File.getBufferID().getValue();
 
@@ -609,11 +622,12 @@ public:
 
     // The end token is exclusive.
     unsigned EndIdx = EndIt - 1 - AllTokens.begin();
-    return new Implementation(File, std::move(AllTokens), StartIdx, EndIdx);
+    return std::unique_ptr<Implementation>(new Implementation(File,
+      std::move(AllTokens), StartIdx, EndIdx));
   }
 
-  static Implementation *createInstance(SourceFile &File, SourceLoc Start,
-                                        SourceLoc End) {
+  static std::unique_ptr<Implementation>
+  createInstance(SourceFile &File, SourceLoc Start, SourceLoc End) {
     if (Start.isInvalid() || End.isInvalid())
       return nullptr;
     SourceManager &SM = File.getASTContext().SourceMgr;
@@ -645,7 +659,7 @@ public:
     bool visitDeclReference(ValueDecl *D, CharSourceRange Range,
                             TypeDecl *CtorTyRef, ExtensionDecl *ExtTyRef, Type T,
                             ReferenceMetaData Data) override {
-      Impl->analyzeDeclRef(D, Range, T, Data);
+      Impl->analyzeDeclRef(D, Range.getStart(), T, Data);
       return true;
     }
   public:
@@ -700,6 +714,8 @@ public:
   }
 
   OrphanKind getOrphanKind(ArrayRef<ASTNode> Nodes) {
+    if (Nodes.empty())
+      return OrphanKind::None;
 
     // Prepare the entire range.
     SourceRange WholeRange(Nodes.front().getStartLoc(),
@@ -828,13 +844,13 @@ public:
     return ResolvedRangeInfo(Content);
   }
 
-  void analyzeDeclRef(ValueDecl *VD, CharSourceRange Range, Type Ty,
+  void analyzeDeclRef(ValueDecl *VD, SourceLoc Start, Type Ty,
                       ReferenceMetaData Data) {
     // Only collect decl ref.
     if (Data.Kind != SemaReferenceKind::DeclRef)
       return;
 
-    if (!isContainedInSelection(Range))
+    if (!isContainedInSelection(CharSourceRange(Start, 0)))
       return;
 
     // If the VD is declared outside of current file, exclude such decl.
@@ -859,7 +875,7 @@ public:
       ReferencedDecls.emplace_back(VD, Ty);
     } else {
       // LValue type should take precedence.
-      if (!It->Ty->isLValueType() && Ty->isLValueType()) {
+      if (!It->Ty->hasLValueType() && Ty->hasLValueType()) {
         It->Ty = Ty;
       }
     }
@@ -893,7 +909,7 @@ RangeResolver::RangeResolver(SourceFile &File, SourceLoc Start, SourceLoc End) :
 RangeResolver::RangeResolver(SourceFile &File, unsigned Offset, unsigned Length) :
   Impl(Implementation::createInstance(File, Offset, Length)) {}
 
-RangeResolver::~RangeResolver() { if (Impl) delete Impl; }
+RangeResolver::~RangeResolver() = default;
 
 bool RangeResolver::walkToExprPre(Expr *E) {
   if (!Impl->shouldEnter(E))
@@ -940,7 +956,7 @@ bool RangeResolver::walkToDeclPost(Decl *D) {
 bool RangeResolver::
 visitDeclReference(ValueDecl *D, CharSourceRange Range, TypeDecl *CtorTyRef,
                    ExtensionDecl *ExtTyRef, Type T, ReferenceMetaData Data) {
-  Impl->analyzeDeclRef(D, Range, T, Data);
+  Impl->analyzeDeclRef(D, Range.getStart(), T, Data);
   return true;
 }
 

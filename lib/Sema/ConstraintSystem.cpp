@@ -379,7 +379,7 @@ Type ConstraintSystem::openUnboundGenericType(UnboundGenericType *unbound,
 
   if (parentTy) {
     auto subs = parentTy->getContextSubstitutions(
-      parentTy->getAnyNominal());
+      unboundDecl->getDeclContext());
     for (auto pair : subs) {
       auto found = replacements.find(
         cast<GenericTypeParamType>(pair.first));
@@ -1314,7 +1314,11 @@ void ConstraintSystem::addOverloadSet(Type boundType,
                                        *favoredChoice,
                                        useDC,
                                        locator);
-    
+
+    assert((!favoredChoice->isDecl() ||
+            !favoredChoice->getDecl()->getAttrs().isUnavailable(
+                getASTContext())) &&
+           "Cannot make unavailable decl favored!");
     bindOverloadConstraint->setFavored();
     
     overloads.push_back(bindOverloadConstraint);
@@ -1700,17 +1704,17 @@ Type simplifyTypeImpl(ConstraintSystem &cs, Type type, Fn getFixedTypeFn) {
         lookupBaseType = objectType;
       }
 
-      if (!lookupBaseType->mayHaveMembers()) return type;
-
-      auto subs = lookupBaseType->getContextSubstitutionMap(
+      if (lookupBaseType->mayHaveMembers()) {
+        auto subs = lookupBaseType->getContextSubstitutionMap(
           cs.DC->getParentModule(),
-          assocType->getDeclContext());
-      auto result = assocType->getDeclaredInterfaceType().subst(subs);
+            assocType->getDeclContext());
+        auto result = assocType->getDeclaredInterfaceType().subst(subs);
 
-      if (result)
-        return result;
+        if (result)
+          return result;
+      }
 
-      return DependentMemberType::get(ErrorType::get(newBase), assocType);
+      return DependentMemberType::get(lookupBaseType, assocType);
     }
 
     return type;
@@ -1749,15 +1753,13 @@ Type Solution::simplifyType(Type type) const {
 }
 
 size_t Solution::getTotalMemory() const {
-  return sizeof(*this) +
-    typeBindings.getMemorySize() +
-    overloadChoices.getMemorySize() +
-    ConstraintRestrictions.getMemorySize() +
-    llvm::capacity_in_bytes(Fixes) +
-    DisjunctionChoices.getMemorySize() +
-    OpenedTypes.getMemorySize() +
-    OpenedExistentialTypes.getMemorySize() +
-    (DefaultedConstraints.size() * sizeof(void*));
+  return sizeof(*this) + typeBindings.getMemorySize() +
+         overloadChoices.getMemorySize() +
+         ConstraintRestrictions.getMemorySize() +
+         llvm::capacity_in_bytes(Fixes) + DisjunctionChoices.getMemorySize() +
+         OpenedTypes.getMemorySize() + OpenedExistentialTypes.getMemorySize() +
+         (DefaultedConstraints.size() * sizeof(void *)) +
+         llvm::capacity_in_bytes(Conformances);
 }
 
 DeclName OverloadChoice::getName() const {

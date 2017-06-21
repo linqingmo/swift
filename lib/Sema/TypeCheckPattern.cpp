@@ -869,6 +869,12 @@ bool TypeChecker::typeCheckPattern(Pattern *P, DeclContext *dc,
   case PatternKind::Typed: {
     TypedPattern *TP = cast<TypedPattern>(P);
     bool hadError = validateTypedPattern(*this, dc, TP, options, &resolver);
+
+    // If we have unbound generic types, don't apply them below; instead,
+    // the caller will call typeCheckBinding() later.
+    if (P->getType()->hasUnboundGenericType())
+      return hadError;
+
     Pattern *subPattern = TP->getSubPattern();
     if (coercePatternToType(subPattern, dc, P->getType(),
                             options|TR_FromNonInferredPattern, &resolver,
@@ -1450,16 +1456,54 @@ recur:
 
     // If there is a subpattern, push the enum element type down onto it.
     if (EEP->hasSubPattern()) {
+      Pattern *sub = EEP->getSubPattern();
+      if (!Context.isSwiftVersion3() && !elt->hasAssociatedValues()) {
+        diagnose(EEP->getLoc(),
+                 diag::enum_element_pattern_assoc_values_mismatch,
+                 EEP->getName());
+        diagnose(EEP->getLoc(), diag::enum_element_pattern_assoc_values_remove)
+          .fixItRemove(sub->getSourceRange());
+        return true;
+      }
+      
       Type elementType;
       if (auto argType = elt->getArgumentInterfaceType())
         elementType = enumTy->getTypeOfMember(elt->getModuleContext(),
                                               elt, argType);
       else
         elementType = TupleType::getEmpty(Context);
-      Pattern *sub = EEP->getSubPattern();
       if (coercePatternToType(sub, dc, elementType,
-                     subOptions|TR_FromNonInferredPattern|TR_EnumPatternPayload,
-                     resolver))
+                              subOptions|TR_FromNonInferredPattern|TR_EnumPatternPayload,
+                              resolver))
+        return true;
+      EEP->setSubPattern(sub);
+    } else if (auto argType = elt->getArgumentInterfaceType()) {
+      // Else if the element pattern has no sub-pattern but the element type has
+      // associated values, expand it to be semantically equivalent to an
+      // element pattern of wildcards.
+      Type elementType = enumTy->getTypeOfMember(elt->getModuleContext(),
+                                                 elt, argType);
+      SmallVector<TuplePatternElt, 8> elements;
+      if (auto *TTy = dyn_cast<TupleType>(elementType.getPointer())) {
+        for (auto &elt : TTy->getElements()) {
+          auto *subPattern = new (Context) AnyPattern(SourceLoc());
+          elements.push_back(TuplePatternElt(elt.getName(), SourceLoc(),
+                                             subPattern));
+        }
+      } else {
+        auto parenTy = dyn_cast<ParenType>(elementType.getPointer());
+        assert(parenTy && "Associated value type is neither paren nor tuple?");
+        
+        auto *subPattern = new (Context) AnyPattern(SourceLoc());
+        elements.push_back(TuplePatternElt(Identifier(), SourceLoc(),
+                                           subPattern));
+      }
+      Pattern *sub = TuplePattern::createSimple(Context, SourceLoc(),
+                                                elements, SourceLoc(),
+                                                /*implicit*/true);
+      if (coercePatternToType(sub, dc, elementType,
+                              subOptions|TR_FromNonInferredPattern|TR_EnumPatternPayload,
+                              resolver))
         return true;
       EEP->setSubPattern(sub);
     }
@@ -1578,11 +1622,12 @@ bool TypeChecker::coerceParameterListToType(ParameterList *P, ClosureExpr *CE,
         param->setInterfaceType(CE->mapTypeOutOfContext(ty));
       }
     }
-
-    if (!ty->isMaterializable()) {
-      if (ty->is<InOutType>()) {
-        param->setLet(false);
-      } else if (param->hasName()) {
+    
+    assert(!ty->hasLValueType() && "Bound param type to @lvalue?");
+    if (ty->is<InOutType>()) {
+      param->setLet(false);
+    } else if (auto *TTy = ty->getAs<TupleType>()) {
+      if (param->hasName() && TTy->hasInOutElement()) {
         diagnose(param->getStartLoc(),
                  diag::param_type_non_materializable_tuple, ty);
       }

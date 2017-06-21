@@ -408,18 +408,14 @@ enum ScoreKind {
   SK_CollectionUpcastConversion,
   /// A value-to-optional conversion.
   SK_ValueToOptional,
-  /// A conversion from an inout to a pointer of matching element type.
-  SK_ScalarPointerConversion,
-  /// A conversion from an array to a pointer of matching element type.
-  SK_ArrayPointerConversion,
   /// A conversion to an empty existential type ('Any' or '{}').
   SK_EmptyExistentialConversion,
   /// A key path application subscript.
   SK_KeyPathSubscript,
-  // A conversion from a string to a pointer.
-  SK_StringToPointerConversion,
+  /// A conversion from a string, array, or inout to a pointer.
+  SK_ValueToPointerConversion,
 
-  SK_LastScoreKind = SK_StringToPointerConversion,
+  SK_LastScoreKind = SK_ValueToPointerConversion,
 };
 
 /// The number of score kinds.
@@ -565,6 +561,9 @@ public:
 
   /// The locators of \c Defaultable constraints whose defaults were used.
   llvm::SmallPtrSet<ConstraintLocator *, 8> DefaultedConstraints;
+
+  llvm::SmallVector<std::pair<ConstraintLocator *, ProtocolConformanceRef>, 8>
+      Conformances;
 
   /// \brief Simplify the given type by substituting all occurrences of
   /// type variables for their fixed types.
@@ -971,6 +970,9 @@ private:
   SmallVector<std::pair<ConstraintLocator *, ArchetypeType *>, 4>
     OpenedExistentialTypes;
 
+  SmallVector<std::pair<ConstraintLocator *, ProtocolConformanceRef>, 8>
+      CheckedConformances;
+
 public:
   /// The locators of \c Defaultable constraints whose defaults were used.
   SmallVector<ConstraintLocator *, 8> DefaultedConstraints;
@@ -1339,6 +1341,8 @@ public:
 
     /// The length of \c DefaultedConstraints.
     unsigned numDefaultedConstraints;
+
+    unsigned numCheckedConformances;
 
     /// The previous score.
     Score PreviousScore;
@@ -2631,7 +2635,8 @@ public:
 /// the parameters (as described by the given parameter type).
 ///
 /// \param argTuple The arguments.
-/// \param paramTuple The parameters.
+/// \param params The parameters.
+/// \param defaultMap A map indicating if the parameter at that index has a default value.
 /// \param hasTrailingClosure Whether the last argument is a trailing closure.
 /// \param allowFixes Whether to allow fixes when matching arguments.
 ///
@@ -2642,7 +2647,8 @@ public:
 /// bound to each of the parameters.
 /// \returns true if the call arguments could not be matched to the parameters.
 bool matchCallArguments(ArrayRef<CallArgParam> argTuple,
-                        ArrayRef<CallArgParam> paramTuple,
+                        ArrayRef<AnyFunctionType::Param> params,
+                        const SmallVectorImpl<bool> &defaultMap,
                         bool hasTrailingClosure,
                         bool allowFixes,
                         MatchCallArgumentListener &listener,

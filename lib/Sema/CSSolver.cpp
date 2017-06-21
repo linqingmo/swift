@@ -201,6 +201,9 @@ Solution ConstraintSystem::finalize(
   solution.DefaultedConstraints.insert(DefaultedConstraints.begin(),
                                        DefaultedConstraints.end());
 
+  for (auto &e : CheckedConformances)
+    solution.Conformances.push_back({e.first, e.second});
+
   return solution;
 }
 
@@ -260,6 +263,10 @@ void ConstraintSystem::applySolution(const Solution &solution) {
   // Register the defaulted type variables.
   DefaultedConstraints.append(solution.DefaultedConstraints.begin(),
                               solution.DefaultedConstraints.end());
+
+  // Register the conformances checked along the way to arrive to solution.
+  for (auto &conformance : solution.Conformances)
+    CheckedConformances.push_back(conformance);
 
   // Register any fixes produced along this path.
   Fixes.append(solution.Fixes.begin(), solution.Fixes.end());
@@ -452,6 +459,7 @@ ConstraintSystem::SolverScope::SolverScope(ConstraintSystem &cs)
   numOpenedTypes = cs.OpenedTypes.size();
   numOpenedExistentialTypes = cs.OpenedExistentialTypes.size();
   numDefaultedConstraints = cs.DefaultedConstraints.size();
+  numCheckedConformances = cs.CheckedConformances.size();
   PreviousScore = cs.CurrentScore;
 
   cs.solverState->registerScope(this);
@@ -502,7 +510,10 @@ ConstraintSystem::SolverScope::~SolverScope() {
 
   // Remove any defaulted type variables.
   truncate(cs.DefaultedConstraints, numDefaultedConstraints);
-  
+
+  // Remove any conformances checked along the current path.
+  truncate(cs.CheckedConformances, numCheckedConformances);
+
   // Reset the previous score.
   cs.CurrentScore = PreviousScore;
 
@@ -1379,7 +1390,7 @@ static bool tryTypeVariableBindings(
       // Handle simple subtype bindings.
       if (binding.Kind == AllowedBindingKind::Subtypes &&
           typeVar->getImpl().canBindToLValue() &&
-          !type->isLValueType() &&
+          !type->hasLValueType() &&
           !type->is<InOutType>()) {
         // Try lvalue qualification in addition to rvalue qualification.
         auto subtype = LValueType::get(type);
@@ -2338,11 +2349,21 @@ bool ConstraintSystem::solveRec(SmallVectorImpl<Solution> &solutions,
 /// Whether we should short-circuit a disjunction that already has a
 /// solution when we encounter the given constraint.
 static bool shortCircuitDisjunctionAt(Constraint *constraint,
-                                      Constraint *successfulConstraint) {
-  
+                                      Constraint *successfulConstraint,
+                                      ASTContext &ctx) {
+
   // If the successfully applied constraint is favored, we'll consider that to
   // be the "best".
   if (successfulConstraint->isFavored() && !constraint->isFavored()) {
+#if !defined(NDEBUG)
+    if (successfulConstraint->getKind() == ConstraintKind::BindOverload) {
+      auto overloadChoice = successfulConstraint->getOverloadChoice();
+      assert((!overloadChoice.isDecl() ||
+              !overloadChoice.getDecl()->getAttrs().isUnavailable(ctx)) &&
+             "Unavailable decl should not be favored!");
+    }
+#endif
+
     return true;
   }
   
@@ -2533,7 +2554,8 @@ bool ConstraintSystem::solveSimplified(
     // short-circuit the disjunction.
     if (lastSolvedChoice) {
       auto *lastChoice = lastSolvedChoice->getConstraint();
-      if (shortCircuitDisjunctionAt(&currentChoice, lastChoice))
+      if (shortCircuitDisjunctionAt(&currentChoice, lastChoice,
+                                    getASTContext()))
         break;
     }
 

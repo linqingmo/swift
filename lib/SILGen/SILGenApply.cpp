@@ -147,6 +147,19 @@ static bool canUseStaticDispatch(SILGenFunction &SGF,
   return false;
 }
 
+static SILValue getOriginalSelfValue(SILValue selfValue) {
+  if (auto *BBI = dyn_cast<BeginBorrowInst>(selfValue))
+    selfValue = BBI->getOperand();
+
+  while (auto *UI = dyn_cast<UpcastInst>(selfValue))
+    selfValue = UI->getOperand();
+
+  if (auto *UTBCI = dyn_cast<UncheckedTrivialBitCastInst>(selfValue))
+    selfValue = UTBCI->getOperand();
+
+  return selfValue;
+}
+
 namespace {
 
 /// Abstractly represents a callee, which may be a constant or function value,
@@ -288,9 +301,7 @@ public:
                                SILDeclRef c,
                                SubstitutionList subs,
                                SILLocation l) {
-    while (auto *UI = dyn_cast<UpcastInst>(selfValue))
-      selfValue = UI->getOperand();
-
+    selfValue = getOriginalSelfValue(selfValue);
     auto formalType = getConstantFormalInterfaceType(SGF, c);
     return Callee(Kind::SuperMethod, SGF, selfValue, c,
                   formalType, formalType, subs, l);
@@ -857,13 +868,17 @@ public:
 
     auto afd = dyn_cast<AbstractFunctionDecl>(e->getDecl());
 
+    CaptureInfo captureInfo;
+
     // Otherwise, we have a statically-dispatched call.
-    SubstitutionList subs;
-    if (e->getDeclRef().isSpecialized() &&
-        (!afd ||
-         !afd->getDeclContext()->isLocalContext() ||
-         afd->getCaptureInfo().hasGenericParamCaptures()))
-      subs = e->getDeclRef().getSubstitutions();
+    SubstitutionList subs = e->getDeclRef().getSubstitutions();
+
+    if (afd) {
+      captureInfo = SGF.SGM.Types.getLoweredLocalCaptures(afd);
+      if (afd->getDeclContext()->isLocalContext() &&
+          !captureInfo.hasGenericParamCaptures())
+        subs = SubstitutionList();
+    }
 
     // Enum case constructor references are open-coded.
     if (isa<EnumElementDecl>(e->getDecl()))
@@ -873,7 +888,7 @@ public:
     
     // If the decl ref requires captures, emit the capture params.
     if (afd) {
-      if (SGF.SGM.M.Types.hasLoweredLocalCaptures(afd)) {
+      if (!captureInfo.getCaptures().empty()) {
         SmallVector<ManagedValue, 4> captures;
         SGF.emitCaptures(e, afd, CaptureEmission::ImmediateApplication,
                          captures);
@@ -2558,7 +2573,7 @@ private:
 
   bool isUnmaterializableTupleType(CanType type) {
     if (auto tuple = dyn_cast<TupleType>(type))
-      if (!tuple->isMaterializable())
+      if (tuple->hasInOutElement())
         return true;
     return false;
   }
@@ -3036,7 +3051,8 @@ private:
     auto doBridge = [&](SILGenFunction &SGF,
                         SILLocation loc,
                         ManagedValue emittedArg,
-                        SILType loweredResultTy) -> ManagedValue {
+                        SILType loweredResultTy,
+                        SGFContext context) -> ManagedValue {
       // If the argument is not already a class instance, bridge it.
       if (!emittedArg.getType().getSwiftRValueType()->mayHaveSuperclass()
           && !emittedArg.getType().isClassExistentialType()) {
@@ -3079,14 +3095,15 @@ private:
     } else if (!nativeIsOptional && bridgedIsOptional) {
       auto paramObjTy = SGF.getSILType(param).getAnyOptionalObjectType();
       auto transformed = doBridge(SGF, argExpr, emittedArg,
-                                  paramObjTy);
+                                  paramObjTy, SGFContext());
       // Inject into optional.
       auto opt = SGF.B.createEnum(argExpr, transformed.getValue(),
                                   SGF.getASTContext().getOptionalSomeDecl(),
                                   SGF.getSILType(param));
       return ManagedValue(opt, transformed.getCleanup());
     } else {
-      return doBridge(SGF, argExpr, emittedArg, SGF.getSILType(param));
+      return doBridge(SGF, argExpr, emittedArg, SGF.getSILType(param),
+                      SGFContext());
     }
   }
   
@@ -4273,12 +4290,8 @@ RValue CallEmission::applyPartiallyAppliedSuperMethod(
   auto loc = uncurriedLoc.getValue();
   auto subs = callee.getSubstitutions();
   auto upcastedSelf = uncurriedArgs.back();
-  SILValue upcastedSelfValue = upcastedSelf.getValue();
-  // Support stripping off a borrow.
-  if (auto *borrowedSelf = dyn_cast<BeginBorrowInst>(upcastedSelfValue)) {
-    upcastedSelfValue = borrowedSelf->getOperand();
-  }
-  SILValue self = cast<UpcastInst>(upcastedSelfValue)->getOperand();
+  auto upcastedSelfValue = upcastedSelf.getValue();
+  auto self = getOriginalSelfValue(upcastedSelfValue);
   auto constantInfo = SGF.getConstantInfo(callee.getMethodName());
   auto functionTy = constantInfo.getSILType();
   SILValue superMethodVal =
@@ -4577,6 +4590,15 @@ SILGenFunction::emitApplyOfLibraryIntrinsic(SILLocation loc,
   if (auto *genericSig = fn->getGenericSignature())
     genericSig->getSubstitutions(subMap, subs);
 
+  return emitApplyOfLibraryIntrinsic(loc, fn, subs, args, ctx);
+}
+
+RValue
+SILGenFunction::emitApplyOfLibraryIntrinsic(SILLocation loc,
+                                            FuncDecl *fn,
+                                            const SubstitutionList &subs,
+                                            ArrayRef<ManagedValue> args,
+                                            SGFContext ctx) {
   auto callee = Callee::forDirect(*this, SILDeclRef(fn), subs, loc);
 
   auto origFormalType = callee.getOrigFormalType();
@@ -4740,14 +4762,7 @@ RValue SILGenFunction::emitLiteral(LiteralExpr *literal, SGFContext C) {
     init = stringLiteral->getInitializer();
   } else {
     ASTContext &ctx = getASTContext();
-    SourceLoc loc;
-  
-    // If "overrideLocationForMagicIdentifiers" is set, then we use it as the
-    // location point for these magic identifiers.
-    if (overrideLocationForMagicIdentifiers)
-      loc = overrideLocationForMagicIdentifiers.getValue();
-    else
-      loc = literal->getStartLoc();
+    SourceLoc loc = literal->getStartLoc();
 
     auto magicLiteral = cast<MagicIdentifierLiteralExpr>(literal);
     switch (magicLiteral->getKind()) {
@@ -4888,6 +4903,15 @@ static Callee getBaseAccessorFunctionRef(SILGenFunction &SGF,
                                          bool isDirectUse,
                                          SubstitutionList subs) {
   auto *decl = cast<AbstractFunctionDecl>(constant.getDecl());
+
+  // The accessor might be a local function that does not capture any
+  // generic parameters, in which case we don't want to pass in any
+  // substitutions.
+  auto captureInfo = SGF.SGM.Types.getLoweredLocalCaptures(decl);
+  if (decl->getDeclContext()->isLocalContext() &&
+      !captureInfo.hasGenericParamCaptures()) {
+    subs = SubstitutionList();
+  }
 
   // If this is a method in a protocol, generate it as a protocol call.
   if (isa<ProtocolDecl>(decl->getDeclContext())) {
@@ -5191,7 +5215,7 @@ emitGetAccessor(SILLocation loc, SILDeclRef get,
     accessType = cast<AnyFunctionType>(accessType.getResult());
   }
   // Index or () if none.
-  if (!subscripts)
+  if (subscripts.isNull())
     subscripts = emitEmptyTupleRValue(loc, SGFContext());
 
   emission.addCallSite(loc, ArgumentSource(loc, std::move(subscripts)),
@@ -5229,7 +5253,7 @@ void SILGenFunction::emitSetAccessor(SILLocation loc, SILDeclRef set,
   }
 
   // (value)  or (value, indices)
-  if (subscripts) {
+  if (!subscripts.isNull()) {
     // If we have a value and index list, create a new rvalue to represent the
     // both of them together.  The value goes first.
     SmallVector<ManagedValue, 4> Elts;
@@ -5288,7 +5312,7 @@ emitMaterializeForSetAccessor(SILLocation loc, SILDeclRef materializeForSet,
 
     elts.push_back(ManagedValue::forLValue(callbackStorage));
 
-    if (subscripts) {
+    if (!subscripts.isNull()) {
       std::move(subscripts).getAll(elts);
     }
     return RValue::withPreExplodedElements(elts, accessType.getInput());
@@ -5360,7 +5384,7 @@ emitAddressorAccessor(SILLocation loc, SILDeclRef addressor,
     accessType = cast<AnyFunctionType>(accessType.getResult());
   }
   // Index or () if none.
-  if (!subscripts)
+  if (subscripts.isNull())
     subscripts = emitEmptyTupleRValue(loc, SGFContext());
 
   emission.addCallSite(loc, ArgumentSource(loc, std::move(subscripts)),
